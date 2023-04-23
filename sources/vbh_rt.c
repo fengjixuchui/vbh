@@ -17,7 +17,6 @@
 #include <asm/desc.h>
 #include <asm/msr.h>
 #include <asm/tlbflush.h>
-#include <linux/kvm_host.h>
 #include <asm/vmx.h>
 #include <asm/msr-index.h>
 #include <asm/special_insns.h>
@@ -30,8 +29,6 @@
 
 #include "vmx_common.h"
 #include "vbh_status.h"
-
-#define __ex(x) x
 
 #define CR0	0
 #define CR3	3
@@ -47,10 +44,9 @@
 
 #define EXIT_REASON_INIT        3
 
-struct vmx_capability {
-	u32 ept;
-	u32 vpid;
-};
+#define EXIT_REASON_INIT        3
+#define VMX_AR_DPL_SHIFT        5
+#define VMX_AR_DPL(ar)          (((ar) >> VMX_AR_DPL_SHIFT) & 3)
 
 static struct vmx_capability vmx_cap;
 
@@ -130,7 +126,7 @@ static inline void vbh_invept(int ext, u64 eptp, u64 gpa)
 	pr_err("<1> cpu_switch_invept: ext=%d, eptp=0x%llx, gpa=0x%llx",
 		ext, eptp, gpa);
 
-	asm volatile(__ex(ASM_VMX_INVEPT)
+	asm volatile(__ex(VBH_ASM_VMX_INVEPT)
 		:
 		: "a" (&operand), "c" (ext)
 		: "cc", "memory"
@@ -149,6 +145,14 @@ void vbh_tlb_shootdown(void)
 		vbh_invept(VMX_EPT_EXTENT_CONTEXT, __pa(vmx_eptp_pml4), 0);
 	else
 		pr_err("<1> ERROR:  Unsupported EPT EXTENT!!!!\n");
+}
+
+static u32 get_cpl(void)
+{
+	u32 access_rights;
+	access_rights = vmcs_read32(GUEST_SS_AR_BYTES);
+	
+	return VMX_AR_DPL(access_rights);
 }
 
 static void skip_emulated_instruction(struct vcpu_vmx *vcpu)
@@ -211,7 +215,7 @@ void handle_ept_violation(struct vcpu_vmx *vcpu)
 {
 	unsigned long exit_qual = vmcs_readl(EXIT_QUALIFICATION);
 	unsigned long long gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
-	unsigned long long gla = vmcs_read64(GUEST_LINEAR_ADDRESS);
+	unsigned long gla = vmcs_readl(GUEST_LINEAR_ADDRESS);
 	unsigned long g_rsp, g_rip;
 
 	int allow = 0;
@@ -219,7 +223,7 @@ void handle_ept_violation(struct vcpu_vmx *vcpu)
 	g_rsp = vmcs_readl(GUEST_RSP);
 	g_rip = vmcs_readl(GUEST_RIP);
 
-	pr_err("EPT_VIOLATION at GPA -> 0x%llx GVA -> 0x%llx, exit_qulification = 0x%lx, G_RSP = 0x%lx, G_RIP=0x%lx\n",
+	pr_err("EPT_VIOLATION at GPA -> 0x%llx GVA -> 0x%lx, exit_qulification = 0x%lx, G_RSP = 0x%lx, G_RIP=0x%lx\n",
 		gpa, gla, exit_qual, g_rsp, g_rip);
 
 	if (hvi_handle_ept_violation(gpa, gla, &allow))
@@ -234,6 +238,11 @@ void handle_vmcall(struct vcpu_vmx *vcpu)
 {
 	u64 hypercall_id;
 	u64 params;
+
+	int cpl = get_cpl();
+
+	if (cpl != 0)
+		goto out;
 
 	hypercall_id = vcpu->regs[VCPU_REGS_RAX];
 	params = vcpu->regs[VCPU_REGS_RBX];
@@ -254,6 +263,8 @@ void handle_vmcall(struct vcpu_vmx *vcpu)
 		hvi_handle_event_vmcall();
 		break;
 	}
+
+out:
 	skip_emulated_instruction(vcpu);
 }
 
@@ -407,11 +418,11 @@ void vmx_switch_and_exit_handler (void)
 	}
 
 	vcpu_ptr = this_cpu_ptr(vcpu);
+	vcpu_ptr->cr2 = read_cr2();
 	reg_area[VCPU_REGS_RIP] = vmcs_readl(GUEST_RIP);
 	reg_area[VCPU_REGS_RSP] = vmcs_readl(GUEST_RSP);
-	reg_area[VCPU_REGS_RFLAG] = vmcs_readl(GUEST_RFLAGS);
 
-	vmexit_reason = vmcs_readl(VM_EXIT_REASON);
+	vmexit_reason = vmcs_read32(VM_EXIT_REASON);
 	vcpu_ptr->instruction_skipped = false;
 	vcpu_ptr->skip_instruction_not_used = false;
 
@@ -476,6 +487,9 @@ void vmx_switch_and_exit_handler (void)
 
 	if (vcpu_ptr->instruction_skipped == true)
 		vmcs_writel(GUEST_RIP, reg_area[VCPU_REGS_RIP]);
+
+	if (vcpu_ptr->cr2 != read_cr2())
+		write_cr2(vcpu_ptr->cr2);
 
 	put_cpu();
 }
@@ -597,7 +611,8 @@ static int inject_pending_vcpu_exceptions(struct vcpu_vmx *vcpu)
         // Is virtual_address field from additional_info valid?
         if(test_bit(virtual_address, additional_info.specific_additional_info.page_fault_specific.field_is_ok))
         {
-            vcpu->regs[VCPU_REGS_CR2] = additional_info.specific_additional_info.page_fault_specific.virtual_address;
+            //vcpu->regs[VCPU_REGS_CR2] = additional_info.specific_additional_info.page_fault_specific.virtual_address;
+            vcpu->cr2 = additional_info.specific_additional_info.page_fault_specific.virtual_address;
         }
 
         return 0;
